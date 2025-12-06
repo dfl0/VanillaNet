@@ -424,7 +424,7 @@ def main(args):
         else:
             real_labels = None
         print(f"Eval only mode")
-        test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp, real_labels=real_labels)
+        test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp, real_labels=real_labels, log_writer=log_writer)
         print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
         return
 
@@ -444,13 +444,15 @@ def main(args):
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
         if wandb_logger:
             wandb_logger.set_steps()
-        if 'VanillaNet' == model.module.__class__. __name__ and epoch <= args.decay_epochs:
+
+        model_ = model.module if hasattr(model, "module") else model
+        if 'VanillaNet' == model_.__class__. __name__ and epoch <= args.decay_epochs:
             if args.decay_linear:
                 act_learn = epoch / args.decay_epochs * 1.0
             else:
                 act_learn = 0.5 * (1 - math.cos(math.pi * epoch / args.decay_epochs)) * 1.0
             print(f"VanillaNet decay_linear: {args.decay_linear}, act_learn weight: {act_learn:.3f}")
-            model.module.change_act(act_learn)
+            model_.change_act(act_learn)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer,
             device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,
@@ -467,7 +469,7 @@ def main(args):
                     loss_scaler=loss_scaler, epoch=epoch, epoch_name=str(epoch), model_ema=model_ema[0])
         
         if (data_loader_val is not None) and (epoch > 0) and (epoch % args.test_freq == 0 or epoch > args.test_epoch):
-            test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
+            test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp, epoch=epoch, log_writer=log_writer)
             print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             if max_accuracy < test_stats["acc1"]:
                 max_accuracy = test_stats["acc1"]
@@ -485,7 +487,7 @@ def main(args):
             # repeat testing routines for EMA, if ema eval is turned on
             if args.model_ema and args.model_ema_eval:
                 for idx, iter_model_ema in enumerate(model_ema):
-                    test_stats_ema = evaluate(data_loader_val, iter_model_ema.ema, device, use_amp=args.use_amp)
+                    test_stats_ema = evaluate(data_loader_val, iter_model_ema.ema, device, use_amp=args.use_amp, log_writer=log_writer, disable_cam=True)  # disable class activation mappings for ema
                     print(f"Accuracy of the {args.model_ema_decay[idx]} EMA on {len(dataset_val)} test images: {test_stats_ema['acc1']:.1f}%")
                     if max_accuracy_ema < test_stats_ema["acc1"]:
                         max_accuracy_ema = test_stats_ema["acc1"]
@@ -548,7 +550,7 @@ def main(args):
         ckpt = torch.load(os.path.join(args.output_dir, 'checkpoint-best-ema.pth'), map_location='cpu')
         msg = model_without_ddp.load_state_dict(ckpt['model_ema'])
         print(msg)
-        test_stats = evaluate(data_loader_val, model_without_ddp, device, use_amp=args.use_amp, real_labels=real_labels)
+        test_stats = evaluate(data_loader_val, model_without_ddp, device, use_amp=args.use_amp, real_labels=real_labels, log_writer=log_writer)
 
 
 if __name__ == '__main__':

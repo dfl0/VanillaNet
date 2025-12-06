@@ -13,7 +13,15 @@ from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
 import logging
 
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+import torchvision
+
 import utils
+
+
+print_freq = 50
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -26,7 +34,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 200
+
+    model_ = model.module if hasattr(model, "module") else model
 
     optimizer.zero_grad()
 
@@ -78,9 +87,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                         iter_model_ema.update(model)
                         for i in range(len(iter_model_ema.ema.stages)):
                             if hasattr(iter_model_ema.ema.stages[i], 'act_learn'):
-                                iter_model_ema.ema.stages[i].act_learn = model.module.stages[i].act_learn
+                                iter_model_ema.ema.stages[i].act_learn = model_.stages[i].act_learn
                             if hasattr(iter_model_ema.ema, 'act_learn'):
-                                iter_model_ema.ema.act_learn = model.module.act_learn
+                                iter_model_ema.ema.act_learn = model_.act_learn
         else: # full precision
             loss /= update_freq
             loss.backward()
@@ -92,11 +101,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                         iter_model_ema.update(model)
                         for i in range(len(iter_model_ema.ema.stages)):
                             if hasattr(iter_model_ema.ema.stages[i], 'act_learn'):
-                                iter_model_ema.ema.stages[i].act_learn = model.module.stages[i].act_learn
+                                iter_model_ema.ema.stages[i].act_learn = model_.stages[i].act_learn
                             if hasattr(iter_model_ema.ema, 'act_learn'):
-                                iter_model_ema.ema.act_learn = model.module.act_learn
+                                iter_model_ema.ema.act_learn = model_.act_learn
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         if mixup_fn is None:
             class_acc = (output.max(-1)[-1] == targets).float().mean()
@@ -149,15 +159,22 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, use_amp=False, real_labels=None):
+def evaluate(data_loader, model, device, use_amp=False, real_labels=None, epoch=None, log_writer=None, disable_cam=False):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
+    
+    model_ = model.module if hasattr(model, "module") else model
+    target_layers = model_.stages
+    cam = GradCAM(model=model_, target_layers=target_layers)
+    imgs_per_batch = 4
 
     # switch to evaluation mode
     model.eval()
-    for batch in metric_logger.log_every(data_loader, 200, header):
+
+    visualized = 0
+    for batch_num, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         images = batch[0]
         target = batch[-1]
 
@@ -182,6 +199,33 @@ def evaluate(data_loader, model, device, use_amp=False, real_labels=None):
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+
+        if not disable_cam and log_writer is not None:
+            for i in range(batch_size):
+                class_idx = target[i].item()
+
+                input_tensor = images[i:i+1]
+                with torch.enable_grad():
+                    grayscale_cam = cam(input_tensor=input_tensor, targets=[ClassifierOutputTarget(target[i].item())])
+
+                if len(grayscale_cam.shape) == 3:
+                    grayscale_cam = grayscale_cam[0]
+
+                grayscale_cam = grayscale_cam.astype(float)
+
+                img = images[i].cpu().permute(1,2,0).numpy()
+                img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+
+                visualization = show_cam_on_image(img, grayscale_cam, use_rgb=True)
+                vis_tensor = torch.tensor(visualization).permute(2,0,1).unsqueeze(0) / 255.0
+                log_writer.writer.add_image(f'GradCAM/Class_{class_idx}/Batch_{batch_num}/Image_{visualized}',
+                                            vis_tensor[0], global_step=log_writer.step)
+                visualized += 1
+
+                if i >= imgs_per_batch:
+                    break
+
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print('* val Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
